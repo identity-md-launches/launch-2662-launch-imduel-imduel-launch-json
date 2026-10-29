@@ -8,10 +8,18 @@ library Strength {
     uint256 internal constant MAX_BPS = 9_000;
     uint256 internal constant BPS_PER_DOUBLING = 903; // 3,000 per tenfold / log2(10)
     uint256 internal constant FLOOR = 100_000; // a share of 1 / FLOOR plays at 0
+    uint256 internal constant FLOOR_BITS = 17; // 2^17 > FLOOR: a payment shifted this far times FLOOR always fits
 
     /// Strength in basis points of a trade paying `paid` into `depth` (both in the same token).
     function fromShare(uint256 paid, uint256 depth) internal pure returns (uint16) {
         if (paid == 0 || depth == 0) return 0;
+        if (paid >= depth) return uint16(MAX_BPS); // the whole depth or more: far past the cap
+        // a payment too large to scale by FLOOR: shift both out of the way (the share is what counts, and both keep
+        // their fraction bits), instead of reverting
+        if (paid > type(uint256).max / FLOOR) {
+            paid >>= FLOOR_BITS;
+            depth >>= FLOOR_BITS;
+        }
         uint256 up = _log2x256(paid * FLOOR);
         uint256 down = _log2x256(depth);
         if (up <= down) return 0;

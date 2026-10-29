@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {Vm} from "forge-std/Test.sol";
+import {V4Fixture} from "./V4Fixture.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
+import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
+import {IChessEngine} from "../src/IChessEngine.sol";
+import {IMDuelHook, IMDUEL_HOOK_FLAGS} from "../src/IMDuelHook.sol";
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {IMDuelHarness, HookConfig} from "./Harness.sol";
+import {Chessboard} from "./Chessboard.sol";
+
+/// Shared setup: v4 PoolManager and routers, two test tokens, engine v5 and the hook (test harness) at an address
+/// carrying its permission bits. By default currency0 stands in for IMD and currency1 for $IMDUEL, and `pool` is
+/// their main duel (fee 3000, spacing 60). Conversion thresholds default to never, so slices just pile up.
+abstract contract Base is Chessboard, V4Fixture {
+    using CurrencyLibrary for Currency;
+    using PoolIdLibrary for PoolKey;
+
+    uint256 constant NEVER = type(uint256).max;
+    bytes32 constant MOVED = keccak256("Moved(bytes32,uint32,uint16,uint16,address,uint256,uint16,uint8,bool)");
+    bytes32 constant BID = keccak256("Bid(bytes32,uint32,uint16,address,uint256,uint16)");
+    bytes32 constant OVER = keccak256("GameOver(bytes32,uint32,uint8,uint16)");
+    bytes32 constant FAILED = keccak256("EngineFailed(bytes32,uint32,uint16)");
+    bytes32 constant REWARD = keccak256("Reward(bytes32,uint32,uint16,address,address,uint256,bool)");
+
+    IChessEngine engine;
+    IMDuelHarness hook;
+    uint256 hooksDeployed;
+    PoolKey pool;
+    PoolId id;
+
+    /// Engine v5 from its own build: it compiles at 200 optimizer runs (foundry.toml); importing it would compile
+    /// the importing file the same way.
+    function v5() internal virtual returns (IChessEngine) {
+        return IChessEngine(vm.deployCode("ChessEngineV5.sol:ChessEngineV5"));
+    }
+
+    /// How many blocks a move takes bids for: 1 in suites written for one-block turns, the launch value (3) where a
+    /// suite overrides it.
+    function turnBlocks() internal view virtual returns (uint256) {
+        return 1;
+    }
+
+    /// The hook with IMD `imd`, no IMD / ETH route and conversions never; $IMDUEL is the other token of the first pool
+    /// opened.
+    function config(IChessEngine e, Currency imd) internal view returns (HookConfig memory) {
+        return HookConfig(manager, e, imd, 0, 0, NEVER, NEVER, NEVER, turnBlocks());
+    }
+
+    /// A hook whose IMD and $IMDUEL are two fresh tokens, their main duel opened (no liquidity), so the default
+    /// currencies route nowhere and can't open a duel. Returns its IMD, for pairing other tokens with.
+    function deployHookAside(IChessEngine e) internal returns (MockERC20 imd) {
+        imd = mockToken("IMD", "IMD");
+        Currency a = Currency.wrap(address(imd));
+        Currency b = Currency.wrap(address(mockToken("IMDUEL", "IMDUEL")));
+        deployHook(config(e, a));
+        (Currency c0, Currency c1) = a < b ? (a, b) : (b, a);
+        initPool(c0, c1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+    }
+
+    function deployHook(HookConfig memory c) internal virtual {
+        engine = c.engine;
+        // a fresh address each time: a redeployed hook would keep the old one's storage (its main duel)
+        address at = address(IMDUEL_HOOK_FLAGS | (uint160(0x1D0E1 + hooksDeployed++) << 40));
+        deployCodeTo("Harness.sol:IMDuelHarness", abi.encode(c), at);
+        hook = IMDuelHarness(at);
+    }
+
+    /// The default setup: managers, tokens, the hook with v5 and the main duel with deep liquidity.
+    function setUpMainDuel() internal {
+        deployV4();
+        deployMintAndApprove2Currencies();
+        deployHook(config(v5(), currency0));
+        (pool, id) = initPool(currency0, currency1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        addLiquidity(pool);
+    }
+
+    function addLiquidity(PoolKey memory k) internal {
+        modifyLiquidityRouter.modifyLiquidity(k, ModifyLiquidityParams(-887220, 887220, 1_000_000e18, 0), "");
+    }
+
+    // ---------------------------------------------------------------- trading
+
+    /// An exact-input trade buying team `team`'s token (0: currency0, 1: currency1) in `pool`.
+    function trade(uint256 team, uint256 amountIn, address owner) internal {
+        swap(pool, team == 1, -int256(amountIn), owner == address(0) ? bytes("") : abi.encodePacked(owner));
+    }
+
+    /// The team playing White in the current game: in game 0 the side the slice isn't taken in, then alternating.
+    function whiteTeam() internal view returns (uint256) {
+        return (st().gameNo & 1) ^ (st().slice ^ 1);
+    }
+
+    function white(uint256 amountIn, address owner) internal {
+        trade(whiteTeam(), amountIn, owner);
+    }
+
+    function black(uint256 amountIn, address owner) internal {
+        trade(1 - whiteTeam(), amountIn, owner);
+    }
+
+    /// Plays the queued turn: a dust trade in the next block by the team that owns it (which then doesn't bid again).
+    function playTurn() internal {
+        uint256 t = toMove();
+        next(12);
+        trade(t, 100, address(0));
+    }
+
+    /// The team whose turn it is.
+    function toMove() internal view returns (uint256) {
+        return whiteTeam() ^ (st().ply & 1);
+    }
+
+    /// Next block, `secs` later. vm.getBlock* because with via_ir a test can reuse a stale block.* value.
+    function next(uint256 secs) internal {
+        vm.warp(vm.getBlockTimestamp() + secs);
+        vm.roll(vm.getBlockNumber() + 1);
+    }
+
+    function st() internal view returns (IMDuelHook.Game memory) {
+        return hook.game(id);
+    }
+
+    /// The top bid for the move being bid for now in pool `pid`: the side to move's.
+    function bidOf(PoolId pid) internal view returns (IMDuelHook.TopBid memory) {
+        IMDuelHook.Game memory g = hook.game(pid);
+        return g.bids[(g.gameNo & 1) ^ (g.slice ^ 1) ^ (g.ply & 1)];
+    }
+
+    /// bidOf the main duel.
+    function bid() internal view returns (IMDuelHook.TopBid memory) {
+        return bidOf(id);
+    }
+
+    function count(Vm.Log[] memory logs, bytes32 topic) internal pure returns (uint256 n) {
+        for (uint256 i; i < logs.length; i++) if (logs[i].topics[0] == topic) n++;
+    }
+
+    function claims(Currency c) internal view returns (uint256) {
+        return manager.balanceOf(address(hook), c.toId());
+    }
+
+    /// What the hook holds in `c`, and what it owes in `c`: the chests of `pools`, the slice pile and the withdrawable
+    /// balances of `who`.
+    function books(Currency c, PoolKey[] memory pools, address[] memory who) internal view returns (uint256, uint256) {
+        uint256 total = hook.pile(c.toId());
+        for (uint256 i; i < pools.length; i++) {
+            if (pools[i].currency0 == c) total += hook.chest(pools[i].toId(), 0);
+            if (pools[i].currency1 == c) total += hook.chest(pools[i].toId(), 1);
+        }
+        for (uint256 j; j < who.length; j++) total += hook.owed(who[j], c.toId());
+        return (claims(c), total);
+    }
+
+    /// Everything the hook holds in `c` is owed to someone.
+    function assertSolvent(Currency c, PoolKey[] memory pools, address[] memory who) internal view {
+        (uint256 held, uint256 total) = books(c, pools, who);
+        assertEq(held, total, "held = chests + pile + owed");
+    }
+
+    /// assertSolvent for the main duel alone, both currencies.
+    function assertSolvent(address[] memory who) internal view {
+        PoolKey[] memory pools = new PoolKey[](1);
+        pools[0] = pool;
+        assertSolvent(pool.currency0, pools, who);
+        assertSolvent(pool.currency1, pools, who);
+    }
+
+    function nobody() internal pure returns (address[] memory) {
+        return new address[](0);
+    }
+}

@@ -8,7 +8,7 @@ libs = ["lib"]
 solc_version = "0.8.26"
 evm_version = "cancun"
 optimizer = true
-# ChessEngineV5 is over Ethereum's 24,576-byte limit at 20,000 runs; at 200 it is 22,111 bytes. One setting for every
+# ChessEngineV5 is over Ethereum's 24,576-byte limit at 20,000 runs; at 200 it is 23,339 bytes (as deployed, launch 2643). One setting for every
 # contract: a second profile duplicates the shared libraries' artifacts and the IMD launch check refuses the build
 optimizer_runs = 200
 via_ir = true

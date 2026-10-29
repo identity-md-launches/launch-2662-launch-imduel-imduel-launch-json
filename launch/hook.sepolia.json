@@ -1,0 +1,36 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "IMDuelHook",
+    "constructorArgs": [
+      "$poolManager",
+      "ENGINE_ADDRESS",
+      "0x0000000000000000000000000000000000000000",
+      "0",
+      "0",
+      "10000000000000000",
+      "0",
+      "1000000000000000000000000",
+      "3"
+    ],
+    "permissions": [
+      "afterInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "name": "IMDuel Test",
+    "symbol": "IMDUELT",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Sepolia (11155111) rehearsal of launch/hook.json: hook launches there pair with ETH only, so the pair currency (the constructor's imd) is native ETH and there is no separate ETH route (ethFee 0). The main duel is $IMDUEL / ETH; the ETH protocol slice converts into $IMDUEL in the main duel itself once 0.01 ETH has piled up. ENGINE_ADDRESS is the ChessEngineV5 address from the Sepolia engine launch (launch/engine.json). Everything else as in launch/hook.json. turnBlocks 3, as on Ethereum (12-second blocks on both)."
+}

@@ -1,0 +1,271 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
+import {Vm} from "forge-std/Test.sol";
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
+import {Bitboard} from "../src/Bitboard.sol";
+import {Rules} from "../src/Rules.sol";
+import {IChessEngine} from "../src/IChessEngine.sol";
+import {IMDuelHook} from "../src/IMDuelHook.sol";
+import {Base} from "./Base.sol";
+import {BlockToken, SkimToken, ReenterToken, VoidToken} from "./Tokens.sol";
+
+/// Fails to choose; its fallback plays the first legal move.
+contract BrokenEngine is IChessEngine {
+    function play(uint256, uint32, uint32, bool, uint256, uint256, uint64[8] calldata, uint32, uint16)
+        external
+        pure
+        returns (uint16, Rules.Played memory)
+    {
+        revert("broken");
+    }
+
+    function playAny(uint256 board, uint32 mover, uint32 other, bool black, uint256)
+        external
+        pure
+        returns (uint16 m, Rules.Played memory)
+    {
+        (uint32 w, uint32 b) = black ? (other, mover) : (mover, other);
+        m = Bitboard.legalMoves(Bitboard.fromBoard(board, w, b), !black)[0];
+        return (m, Rules.move(board, mover, other, black, m));
+    }
+}
+
+/// Fails to choose and to fall back: the turn can only wait.
+contract DeadEngine is IChessEngine {
+    function play(uint256, uint32, uint32, bool, uint256, uint256, uint64[8] calldata, uint32, uint16)
+        external
+        pure
+        returns (uint16, Rules.Played memory)
+    {
+        revert("dead");
+    }
+
+    function playAny(uint256, uint32, uint32, bool, uint256) external pure returns (uint16, Rules.Played memory) {
+        revert("dead");
+    }
+}
+
+/// Anyone can create a pool with any token: hostile tokens and engine failures must never break trading or the books.
+/// Runs out of gas on every choice (a pathological position); its fallback plays the first legal move.
+contract GreedyEngine is IChessEngine {
+    function play(uint256, uint32, uint32, bool, uint256, uint256, uint64[8] calldata, uint32, uint16)
+        external
+        pure
+        returns (uint16, Rules.Played memory)
+    {
+        while (true) {}
+    }
+
+    function playAny(uint256 board, uint32 mover, uint32 other, bool black, uint256)
+        external
+        pure
+        returns (uint16 m, Rules.Played memory)
+    {
+        (uint32 w, uint32 b) = black ? (other, mover) : (mover, other);
+        m = Bitboard.legalMoves(Bitboard.fromBoard(board, w, b), !black)[0];
+        return (m, Rules.move(board, mover, other, black, m));
+    }
+}
+
+contract HostileTest is Base {
+    using CurrencyLibrary for Currency;
+
+    Currency token; // the hostile token, paired with a plain one
+
+    function setUp() public {
+        deployV4();
+    }
+
+    /// A pool of `t` against the hook's IMD (every duel needs a route for its slice), with liquidity.
+    function pairWith(MockERC20 t) internal {
+        MockERC20 q = deployHookAside(v5());
+        for (uint256 i; i < 2; i++) {
+            MockERC20 x = i == 0 ? t : q;
+            x.mint(address(this), 1e30);
+            x.approve(address(swapRouter), type(uint256).max);
+            x.approve(address(modifyLiquidityRouter), type(uint256).max);
+        }
+        t.approve(address(hook), type(uint256).max);
+        (Currency c0, Currency c1) = address(t) < address(q)
+            ? (Currency.wrap(address(t)), Currency.wrap(address(q)))
+            : (Currency.wrap(address(q)), Currency.wrap(address(t)));
+        (pool, id) = initPool(c0, c1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        addLiquidity(pool);
+        token = Currency.wrap(address(t));
+    }
+
+    function tokenTeam() internal view returns (uint256) {
+        return pool.currency0 == token ? 0 : 1;
+    }
+
+    /// The token's team captures a queen with check (3% of its chest) for `owner`.
+    function tokenTeamTakesQueenFor(address owner) internal {
+        bool blackMoves = tokenTeam() != whiteTeam();
+        uint256 b;
+        b = put(b, "e1", 6);
+        b = put(b, "e8", 14);
+        b = put(b, "a1", blackMoves ? 5 : 4);
+        b = put(b, "a8", blackMoves ? 12 : 13);
+        hook.setPosition(id, b, side("e1"), side("e8"), blackMoves ? 1 : 0, 0);
+        hook.applyMove(pool, blackMoves ? mv("a8", "a1") : mv("a1", "a8"), owner, 1e30);
+    }
+
+    function finalizeWithATinyTrade() internal {
+        next(12);
+        trade(1 - tokenTeam(), 100, address(0));
+    }
+
+    // ---------------------------------------------------------------- engine failure
+
+    /// A trade sent with too little gas for the engine must not get the fallback's seeded legal move instead (which
+    /// would let anyone force an unthinking move on the queued turn by choosing the gas limit): it either plays the
+    /// engine's move or reverts (NotEnoughGas), so gas estimates include the move. Swept over gas limits around the engine's cost, each from the same state.
+    function test_starvingTheEngineNeverPlaysTheFallback() public {
+        setUpMainDuel();
+        white(1e18, address(0xA)); // a turn to play
+        next(12);
+        bytes memory call = abi.encodeCall(PoolSwapTest.swap, (pool, SwapParams(toMove() == 1, -1e18,
+            toMove() == 1 ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT), PoolSwapTest.TestSettings(false, false), bytes("")));
+        uint256 played;
+        uint256 reverted;
+        for (uint256 g = 200_000; g <= 900_000; g += 10_000) {
+            uint256 snap = vm.snapshotState();
+            vm.recordLogs();
+            (bool ok,) = address(swapRouter).call{gas: g}(call);
+            Vm.Log[] memory logs = vm.getRecordedLogs();
+            if (ok) {
+                assertEq(count(logs, FAILED), 0, "a starved engine played the fallback move");
+                if (count(logs, MOVED) == 1) played++;
+            } else {
+                reverted++;
+            }
+            vm.revertToState(snap);
+        }
+        assertGt(played, 0, "enough gas plays the engine's move");
+        assertGt(reverted, 0, "too little reverts");
+    }
+
+    /// An engine that burns its whole cap: a trade with less gas than the cap reverts (its estimate can't skip the
+    /// move), a trade with more gets the fallback move at 0%, so a pathological position costs at most ~5M gas once.
+    function test_aGasBurningEngineCostsOneExpensiveTradeNotTheGame() public {
+        deployMintAndApprove2Currencies();
+        deployHook(config(new GreedyEngine(), currency0));
+        (pool, id) = initPool(currency0, currency1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        addLiquidity(pool);
+        white(1e18, address(0xA));
+        next(12);
+        bytes memory call = abi.encodeCall(PoolSwapTest.swap, (pool, SwapParams(whiteTeam() == 0, -1e17,
+            whiteTeam() == 0 ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT), PoolSwapTest.TestSettings(false, false), bytes("")));
+        (bool ok, bytes memory err) = address(swapRouter).call{gas: 1_500_000}(call);
+        assertFalse(ok, "a normal gas limit reverts");
+        assertTrue(err.length > 0);
+        vm.recordLogs();
+        (ok,) = address(swapRouter).call{gas: 6_000_000}(call);
+        assertTrue(ok, "with more than the cap the fallback plays");
+        assertEq(count(vm.getRecordedLogs(), FAILED), 1);
+        assertEq(st().ply, 1);
+        assertEq(st().moveStrength, 0);
+    }
+
+    function test_brokenEngineFallsBackToALegalMove() public {
+        deployMintAndApprove2Currencies();
+        deployHook(config(new BrokenEngine(), currency0));
+        (pool, id) = initPool(currency0, currency1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        addLiquidity(pool);
+        white(1e18, address(0xA));
+        vm.recordLogs();
+        playTurn();
+        assertEq(count(vm.getRecordedLogs(), FAILED), 1);
+        IMDuelHook.Game memory g = st();
+        assertEq(g.ply, 1, "the game still moved");
+        assertEq(g.moveStrength, 0);
+        assertEq(g.moveOwner, address(0xA));
+    }
+
+    /// If the fallback fails too (an engine bug), trading goes on and the turn stays queued, unplayed and unpaid.
+    function test_aDeadEngineLeavesTheTurnQueuedAndTradingGoesOn() public {
+        deployMintAndApprove2Currencies();
+        deployHook(config(new DeadEngine(), currency0));
+        (pool, id) = initPool(currency0, currency1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        addLiquidity(pool);
+        white(1e18, address(0xA));
+        vm.recordLogs();
+        playTurn();
+        assertEq(count(vm.getRecordedLogs(), FAILED), 1);
+        IMDuelHook.Game memory g = st();
+        assertEq(g.ply, 0, "nothing played");
+        assertTrue(bid().open, "still queued");
+        assertEq(bid().owner, address(0xA));
+        next(12);
+        trade(1 - whiteTeam(), 1e18, address(0)); // and the next trade goes through as well
+    }
+
+    // ---------------------------------------------------------------- hostile tokens
+
+    function test_blockedRecipientStaysOwedAndTradingContinues() public {
+        BlockToken t = new BlockToken();
+        pairWith(t);
+        hook.fundChest(pool, tokenTeam() == 1, 100e18);
+        t.block_(address(0xB0B));
+        tokenTeamTakesQueenFor(address(0xB0B)); // played and paid: the token refuses 0xB0B
+        finalizeWithATinyTrade();
+        assertEq(hook.owed(address(0xB0B), token.toId()), 3e18, "kept owed");
+        assertEq(hook.chest(id, tokenTeam()), 97e18);
+        assertEq(claims(token), hook.chest(id, tokenTeam()) + 3e18 + hook.pile(token.toId()));
+        trade(tokenTeam(), 1e18, address(0)); // and trading goes on
+    }
+
+    function test_feeOnTransferTokenFundsOnlyWhatArrives() public {
+        SkimToken t = new SkimToken(); // no liquidity: the test routers can't settle a fee-on-transfer token
+        MockERC20 q = deployHookAside(v5()); // its IMD: every duel needs a route
+        (Currency c0, Currency c1) = address(t) < address(q)
+            ? (Currency.wrap(address(t)), Currency.wrap(address(q)))
+            : (Currency.wrap(address(q)), Currency.wrap(address(t)));
+        (pool, id) = initPool(c0, c1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        token = Currency.wrap(address(t));
+        t.mint(address(this), 1_000e18);
+        t.approve(address(hook), type(uint256).max);
+        hook.fundChest(pool, tokenTeam() == 1, 100e18);
+        assertEq(hook.chest(id, tokenTeam()), 99e18, "the chest records what arrived");
+        assertEq(claims(token), 99e18);
+    }
+
+    /// A token whose transferFrom returns nothing (USDT) funds a chest too (swarm audit, engine launch job).
+    function test_aTokenReturningNothingFundsAChest() public {
+        VoidToken t = new VoidToken();
+        MockERC20 q = deployHookAside(v5()); // its IMD: every duel needs a route
+        (Currency c0, Currency c1) = address(t) < address(q)
+            ? (Currency.wrap(address(t)), Currency.wrap(address(q)))
+            : (Currency.wrap(address(q)), Currency.wrap(address(t)));
+        (pool, id) = initPool(c0, c1, IHooks(address(hook)), 3000, SQRT_PRICE_1_1);
+        token = Currency.wrap(address(t));
+        t.mint(address(this), 1_000e18);
+        t.approve(address(hook), type(uint256).max);
+        hook.fundChest(pool, tokenTeam() == 1, 100e18);
+        assertEq(hook.chest(id, tokenTeam()), 100e18);
+        assertEq(claims(token), 100e18);
+    }
+
+    function test_reenteringTokenCannotBreakAPayout() public {
+        ReenterToken t = new ReenterToken();
+        pairWith(t);
+        hook.fundChest(pool, tokenTeam() == 1, 100e18);
+        // first leave a legitimate reward owed to another owner, so the malicious callback attempts an unlock
+        vm.mockCall(address(t), abi.encodeWithSignature("transfer(address,uint256)", address(0xCAFE), 3e18), abi.encode(false));
+        tokenTeamTakesQueenFor(address(0xCAFE));
+        finalizeWithATinyTrade();
+        assertEq(hook.owed(address(0xCAFE), token.toId()), 3e18);
+        vm.clearMockedCalls();
+        t.arm(address(0xB0B), address(hook), abi.encodeCall(IMDuelHook.withdraw, (address(0xCAFE), token)));
+        tokenTeamTakesQueenFor(address(0xB0B));
+        finalizeWithATinyTrade();
+        assertGt(hook.owed(address(0xB0B), token.toId()), 0, "payout failed safely and is owed");
+        assertEq(t.balanceOf(address(0xB0B)), 0);
+        assertEq(hook.owed(address(0xCAFE), token.toId()), 3e18, "reentrant withdrawal rolled back");
+    }
+}
